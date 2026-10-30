@@ -149,11 +149,11 @@ tr.avgrow td{background:rgba(63,224,240,.10);color:var(--cyan);font-size:12px;fo
   <section class="panel" id="tab-regras" hidden>
     <h2>Como o painel calcula</h2>
     <div class="hint" style="display:flex;flex-direction:column;gap:8px">
-      <p style="margin:0"><b>Lojas na disputa:</b> as lojas GSB e Compactas do arquivo. Linhas com “Express” ou “Outros” no nome ficam de fora.</p>
-      <p style="margin:0"><b>Média nacional:</b> média simples da progressão (%) e da progressão (R$) das lojas na disputa. Loja sem venda A-1 não entra na média em %.</p>
+      <p style="margin:0"><b>Lojas na disputa:</b> as lojas GSB e Compactas com venda no ano passado. Express, “Outros” e lojas sem Venda A-1 não pontuam.</p>
+      <p style="margin:0"><b>Média Brasil (total da rede):</b> soma a venda de todas as lojas com Venda A-1, inclusive as Express (só “Outros” fica de fora), e compara com a soma da Venda A-1. Em %: soma das vendas ÷ soma das A-1 − 1. Em R$: (soma das vendas − soma das A-1) ÷ número de lojas. Conferido com a Memória de Cálculo oficial de 29/10.</p>
       <p style="margin:0"><b>Pontos:</b> só pontua quem fica acima da média. Se N lojas estão acima, a maior progressão leva N pontos e a menor acima da média leva 1 (N − posição + 1). O cálculo é feito separado para % e para R$, e os dois se somam.</p>
       <p style="margin:0"><b>29/10 a 22/11:</b> apuração diária. <b>23 a 30/11 (Black):</b> um bloco único de oito dias, mesma mecânica, pontos em dobro. Suba o arquivo com o bloco fechado.</p>
-      <p style="margin:0"><b>Doping:</b> se você informar a margem do período e a MSV objetivada do mês, o painel zera os pontos quando a margem fica abaixo de 70% da MSV. Itens do código de desconto 12 não entram na margem oficial.</p>
+      <p style="margin:0"><b>Doping:</b> se a margem (%MSV) da loja ficar abaixo de 70% da MSV objetivada do mês, ela perde os pontos do dia, mas continua ocupando a posição no ranking (ninguém herda os pontos dela). Os dois campos são opcionais: preencha a margem (%MSV) da loja e a MSV objetivada do mês para checar o doping. Se o arquivo trouxer a coluna %MSV, a margem é preenchida sozinha.</p>
       <p style="margin:0"><b>Fonte oficial:</b> HI (aba BricoBlack 2026), publicado após as 9h. Os dados do Booster no meio do dia são parciais e podem mudar até o fechamento.</p>
       <p style="margin:0">Pontos extras (Decolagem, MDH e Recordes) não entram neste placar.</p>
     </div>
@@ -164,7 +164,13 @@ tr.avgrow td{background:rgba(63,224,240,.10);color:var(--cyan);font-size:12px;fo
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script id="calc">
-/* ===== Cálculo (puro, sem DOM) ===== */
+/* ===== Cálculo (puro, sem DOM) =====
+   Regra conferida com a Memória de Cálculo oficial (Cerâmica, 29/10/2026):
+   - Média Brasil = total da rede: todas as lojas com Venda A-1 > 0, inclusive Express,
+     exceto "Outros". Em %: soma vendas ÷ soma A-1 − 1. Em R$: (soma vendas − soma A-1) ÷ nº de lojas.
+   - Disputam pontos só as lojas GSB/Compactas (sem Express e Outros) com Venda A-1 > 0.
+   - Acima da média pontua: N − posição + 1, separado para % e R$.
+   - Doping zera só o total da loja; ela continua ocupando a posição no ranking. */
 const Calc = (() => {
   const norm = s => String(s ?? "").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[\s\-_.]/g, "");
   function num(v) {
@@ -187,40 +193,47 @@ const Calc = (() => {
     const venda = idx((x, i) => i !== a1 && /(venda|fatur)/.test(x) && !/(a1|anoanterior|2025|n1|prog)/.test(x));
     const pct = idx(x => /prog/.test(x) && /(%|pct|perc)/.test(x) && !/r\$|rs$|reais/.test(x));
     const rs = idx(x => /prog/.test(x) && /(r\$|rs|reais|valor)/.test(x));
-    return { loja, venda, a1, pct, rs };
+    const msv = idx(x => /msv/.test(x) && !/(a1|n1|obj|min)/.test(x));
+    return { loja, venda, a1, pct, rs, msv };
   }
-  /* rows: array of arrays (first rows may be junk). Returns parsed stores. */
+  /* rows: array of arrays (first rows may be junk). */
   function parse(rows) {
     let hi = -1, cols = null;
     for (let i = 0; i < Math.min(rows.length, 15); i++) {
       const c = findCols(rows[i] || []);
-      if (c.loja >= 0 && (c.venda >= 0 || c.pct >= 0)) { hi = i; cols = c; break; }
+      if (c.loja >= 0 && c.venda >= 0) { hi = i; cols = c; break; }
     }
-    if (hi < 0) throw new Error("Não encontrei o cabeçalho. A planilha precisa ter as colunas Loja, Venda e Venda A-1 (ou Prog %).");
-    if (cols.a1 < 0 && cols.pct < 0) throw new Error("Não encontrei a coluna Venda A-1 nem Prog %.");
-    const stores = [], skipped = [];
+    if (hi < 0) throw new Error("Não encontrei o cabeçalho. A planilha precisa ter as colunas Loja, Venda e Venda A-1.");
+    if (cols.a1 < 0) throw new Error("Não encontrei a coluna Venda A-1. Ela é necessária para calcular o total da rede.");
+    const all = [];
     for (let i = hi + 1; i < rows.length; i++) {
       const r = rows[i] || [];
       const loja = String(r[cols.loja] ?? "").trim();
       if (!loja) continue;
       const n = norm(loja);
       if (/total|^geral/.test(n)) continue;
-      if (/express|outros/.test(n)) { skipped.push(loja); continue; }
-      const venda = cols.venda >= 0 ? num(r[cols.venda]) : null;
-      const a1 = cols.a1 >= 0 ? num(r[cols.a1]) : null;
-      let pct = cols.pct >= 0 ? num(r[cols.pct]) : null;
-      if (cols.pct < 0 && venda !== null && a1) pct = a1 > 0 ? (venda - a1) / a1 : null;
-      if (cols.pct >= 0 && a1 !== null && a1 <= 0) pct = null;
-      let rs = cols.rs >= 0 ? num(r[cols.rs]) : null;
-      if (rs === null && venda !== null && a1 !== null) rs = venda - a1;
-      stores.push({ loja, venda, a1, pct, rs });
+      const venda = num(r[cols.venda]) ?? 0;
+      const a1 = num(r[cols.a1]) ?? 0;
+      let msv = cols.msv >= 0 ? num(r[cols.msv]) : null;
+      if (msv !== null && Math.abs(msv) <= 1) msv = msv * 100;
+      all.push({
+        loja, venda, a1, msv,
+        express: /express/.test(n), outros: /outros/.test(n),
+        pct: a1 > 0 ? venda / a1 - 1 : null, rs: venda - a1
+      });
     }
+    const base = all.filter(s => !s.outros && s.a1 > 0);              // entram na média
+    const stores = all.filter(s => !s.express && !s.outros && s.a1 > 0); // disputam pontos
+    const skipped = all.filter(s => !stores.includes(s)).map(s => s.loja);
     if (stores.length < 5) throw new Error("A planilha tem poucas lojas (" + stores.length + "). Confira se é o export nacional da seção.");
-    return { stores, skipped, cols };
+    return { stores, base, skipped, cols };
   }
-  function rankCrit(stores, key) {
+  function rede(base) {
+    const sv = base.reduce((a, s) => a + s.venda, 0), sa = base.reduce((a, s) => a + s.a1, 0);
+    return { sv, sa, n: base.length, nExpress: base.filter(s => s.express).length, avgPct: sa > 0 ? sv / sa - 1 : null, avgRs: base.length ? (sv - sa) / base.length : null };
+  }
+  function rankCrit(stores, key, avg) {
     const vals = stores.filter(s => s[key] !== null);
-    const avg = vals.reduce((a, s) => a + s[key], 0) / (vals.length || 1);
     const above = vals.filter(s => s[key] > avg).sort((a, b) => b[key] - a[key]);
     const N = above.length;
     const pts = new Map();
@@ -231,13 +244,14 @@ const Calc = (() => {
     });
     return { avg, N, counted: vals.length, pts };
   }
-  /* storeKey: trecho do nome; doping: {margem, msv} em % (opcionais); mult: 1 ou 2 */
+  /* storeKey: nome da loja; opts: {margem, msv} em % (opcionais), mult: 1 ou 2 */
   function score(parsed, storeKey, opts = {}) {
-    const { stores } = parsed;
+    const { stores, base } = parsed;
     const key = norm(storeKey || "bhnorte");
     const exact = stores.filter(s => norm(s.loja) === key);
     const matches = exact.length ? exact : stores.filter(s => norm(s.loja).includes(key));
-    const P = rankCrit(stores, "pct"), R = rankCrit(stores, "rs");
+    const T = rede(base);
+    const P = rankCrit(stores, "pct", T.avgPct), R = rankCrit(stores, "rs", T.avgRs);
     const me = matches[0] || null;
     const mp = me ? P.pts.get(me.loja) : null, mr = me ? R.pts.get(me.loja) : null;
     const ptsPct = mp ? mp.pts : 0, ptsRs = mr ? mr.pts : 0;
@@ -250,18 +264,19 @@ const Calc = (() => {
       loja: s.loja, pct: s.pct, rs: s.rs,
       pp: P.pts.get(s.loja)?.pts || 0, pr: R.pts.get(s.loja)?.pts || 0
     }));
-    // quanto falta para entrar acima da média em R$ e em %
+    // venda extra que a loja precisa (a venda dela também entra no total da rede)
     let gapRs = null, gapPct = null;
-    if (me && me.rs !== null && !mr) gapRs = R.avg - me.rs;
-    if (me && me.pct !== null && !mp && me.a1) gapPct = (P.avg - me.pct) * me.a1;
+    if (me && !mr && T.n > 1) gapRs = (T.avgRs - me.rs) / (1 - 1 / T.n);
+    if (me && !mp && me.a1 > 0 && T.sa > me.a1) gapPct = (T.sv / T.sa - me.venda / me.a1) / (1 / me.a1 - 1 / T.sa);
     return {
       me, multiple: matches.length > 1 ? matches.map(m => m.loja) : null,
-      avgPct: P.avg, avgRs: R.avg, nPct: P.N, nRs: R.N, countedPct: P.counted, countedRs: R.counted,
+      redeVenda: T.sv, redeA1: T.sa, redeN: T.n, redeExpress: T.nExpress,
+      avgPct: T.avgPct, avgRs: T.avgRs, nPct: P.N, nRs: R.N, countedPct: P.counted, countedRs: R.counted,
       rankPct: mp ? mp.rank : null, rankRs: mr ? mr.rank : null,
       ptsPct, ptsRs, mult, bruto, doping, total, gapRs, gapPct, table, nStores: stores.length
     };
   }
-  return { norm, num, parse, score, rankCrit };
+  return { norm, num, parse, score, rankCrit, rede };
 })();
 if (typeof module !== "undefined") module.exports = Calc;
 </script>
@@ -351,6 +366,7 @@ async function readFile(file) {
     const ws = wb.Sheets[wb.SheetNames[0]];
     const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: null });
     parsed = Calc.parse(rows);
+    if ($("fMarg")) { $("fMarg").value = ""; $("fMarg").dataset.auto = "1"; }
     fillStores();
     recompute();
   } catch (err) {
@@ -387,6 +403,13 @@ function readDoping() {
 function recompute() {
   if (!parsed) return;
   const dp = readDoping();
+  dp.auto = false;
+  const fm = $("fMarg");
+  if (!fm || fm.dataset.auto === "1" || dp.margem === null) {
+    const key = Calc.norm(storeKey);
+    const me0 = parsed.stores.find(s => Calc.norm(s.loja) === key) || parsed.stores.find(s => Calc.norm(s.loja).includes(key));
+    if (me0 && me0.msv !== null) { dp.margem = Math.round(me0.msv * 100) / 100; dp.auto = true; }
+  }
   const pk = periodKey();
   const r = Calc.score(parsed, storeKey, { mult: pk === "black" ? 2 : 1, margem: dp.margem, msv: dp.msv });
   pending = { r, pk, sec: $("fSec").value, dp };
@@ -468,9 +491,10 @@ function renderResult() {
         d => (d >= 0 ? "+" : "−") + fmtRs(Math.abs(d)),
         r.nRs, r.countedRs, stRs)}
     </div>
+    <div class="hint" style="max-width:none">Total da rede (${r.redeN} lojas, ${r.redeExpress} Express incluídas na média): venda ${fmtRs(r.redeVenda)} × A-1 ${fmtRs(r.redeA1)}. Disputam pontos: ${r.nStores} lojas.</div>
     ${advice.length ? `<div class="msg warn">${advice.join("<br>")}</div>` : ""}
     <div class="form">
-      <label class="f">Margem da seção no período (%)<input id="fMarg" inputmode="decimal" placeholder="ex.: 28,5" value="${dp.margem ?? ""}"></label>
+      <label class="f">Margem da loja · %MSV (opcional)<input id="fMarg" inputmode="decimal" placeholder="ex.: 15,6" data-auto="${dp.auto ? 1 : 0}" value="${dp.margem === null ? "" : String(dp.margem).replace(".", ",")}"></label>
       <label class="f">MSV objetivada de ${mesTxt} (%)<input id="fMsv" inputmode="decimal" placeholder="ex.: 32" value="${dp.msv ?? ""}"></label>
     </div>
     ${dopTile}
@@ -482,7 +506,8 @@ function renderResult() {
     <div class="row">
       <button class="btn ghost" id="bClear">Limpar</button>
     </div>`;
-  ["fMarg", "fMsv"].forEach(id => $(id).addEventListener("change", recompute));
+  $("fMarg").addEventListener("change", () => { $("fMarg").dataset.auto = "0"; recompute(); });
+  $("fMsv").addEventListener("change", recompute);
   $("bClear").onclick = () => { pending = null; parsed = null; el.hidden = true; $("fileMsg").innerHTML = ""; };
 }
 
